@@ -2,12 +2,6 @@
 """
 MiniMax ACP Agent - An ACP-compatible agent with MiniMax-M2.7 backend.
 Designed for integration with JetBrains IDEs via Agent Client Protocol.
-
-Features:
-- Thinking blocks support
-- Streaming responses
-- MCP server integration
-- Filesystem and shell tools
 """
 
 import json
@@ -154,111 +148,6 @@ class MiniMaxClient:
     def __init__(self):
         self.api_key: Optional[str] = None
 
-    def _get_api_key(self) -> str:
-        if self.api_key:
-            return self.api_key
-        try:
-            result = subprocess.run(
-                ["mmx", "auth", "status", "--output", "json", "--quiet"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            data = json.loads(result.stdout)
-            if data.get("method") == "api-key" and "key" in data:
-                self.api_key = data["key"]
-                return self.api_key
-        except Exception:
-            pass
-        return os.environ.get("MINIMAX_API_KEY", "")
-
-    async def chat_stream(self, messages: list[dict[str, str]]) -> AsyncIterator[dict]:
-        cmd = ["mmx", "text", "chat", "--stream"]
-
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                text_content = " ".join(
-                    c.get("text", "") for c in content if c.get("type") == "text"
-                )
-            else:
-                text_content = str(content).replace("\n", " ").strip()
-            cmd.extend(["--message", f"{role}:{text_content}"])
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        thinking_content = ""
-        response_content = ""
-        thinking_done = False
-
-        while True:
-            line = await process.stdout.readline()
-            if not line:
-                break
-
-            decoded = line.decode("utf-8").strip()
-
-            if decoded.startswith("Thinking:"):
-                thinking_content = decoded.replace("Thinking:", "").strip()
-                thinking_done = False
-            elif decoded.startswith("Response:"):
-                response_content = decoded.replace("Response:", "").strip()
-                thinking_done = True
-                if thinking_content:
-                    yield {
-                        "type": "thinking",
-                        "thinking": thinking_content,
-                        "done": False,
-                    }
-            elif decoded.startswith("{") and "content" in decoded:
-                try:
-                    data = json.loads(decoded)
-                    content = data.get("content", [])
-                    if isinstance(content, list):
-                        for item in content:
-                            if item.get("type") == "thinking":
-                                thinking_content = item.get("thinking", "")
-                                yield {
-                                    "type": "thinking",
-                                    "thinking": thinking_content,
-                                    "done": False,
-                                }
-                            elif item.get("type") == "text":
-                                text_val = item.get("text", "")
-                                if text_val and not thinking_done:
-                                    thinking_done = True
-                                    yield {
-                                        "type": "content",
-                                        "content": [{"type": "text", "text": text_val}],
-                                        "done": False,
-                                    }
-                except json.JSONDecodeError:
-                    pass
-            elif decoded and not decoded.startswith("{"):
-                if response_content:
-                    response_content += "\n" + decoded
-                elif thinking_content:
-                    thinking_content += "\n" + decoded
-                else:
-                    response_content = decoded
-
-        await process.wait()
-
-        if thinking_content and not thinking_done:
-            yield {"type": "thinking", "thinking": thinking_content, "done": True}
-
-        if response_content:
-            yield {
-                "type": "content",
-                "content": [{"type": "text", "text": response_content}],
-                "done": True,
-            }
-
     def chat(self, messages: list[dict[str, str]], **kwargs) -> str:
         cmd = ["mmx", "text", "chat", "--output", "json"]
 
@@ -378,7 +267,7 @@ class MiniMaxACPAgent:
     def __init__(self):
         self.client = MiniMaxClient()
         self.sessions: dict[str, list[dict]] = {}
-        self.protocol_version = "1.0"
+        self.protocol_version = 1
         self.mcp_servers: dict[str, MCPServer] = {}
         self._mcp_tools: dict[str, dict] = {}
 
@@ -405,16 +294,6 @@ Always:
 - Ask for clarification if a request is ambiguous
 
 Current working directory is where you were invoked."""
-
-    def set_mcp_servers(self, mcp_config: dict):
-        self._mcp_tools = {}
-        for name, config in mcp_config.items():
-            cmd = config.get("command", "")
-            args = config.get("args", [])
-            env = config.get("env", {})
-            if cmd:
-                server = MCPServer(name, cmd, args, env)
-                self.mcp_servers[name] = server
 
     async def _execute_tool(self, tool_name: str, arguments: dict) -> dict:
         try:
@@ -550,43 +429,14 @@ Current working directory is where you were invoked."""
             {"role": "system", "content": self._build_system_prompt()},
         ] + session_messages
 
-        full_response = ""
-        async for block in self.client.chat_stream(messages_for_llm):
-            if block.get("type") == "thinking":
-                yield {
-                    "type": "content",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"[Thinking: {block.get('thinking', '')}]",
-                        }
-                    ],
-                    "done": False,
-                }
-            elif block.get("type") == "content":
-                content = block.get("content", [])
-                if isinstance(content, list):
-                    for item in content:
-                        if item.get("type") == "text":
-                            text_val = item.get("text", "")
-                            full_response += text_val
-                            yield {
-                                "type": "content",
-                                "content": [{"type": "text", "text": text_val}],
-                                "done": block.get("done", False),
-                            }
-
+        full_response = self.client.chat(messages_for_llm)
         session_messages.append({"role": "assistant", "content": full_response})
 
-        if self._mcp_tools:
-            tools_response = "\n\nAvailable MCP tools:\n"
-            for tool_name, tool_info in self._mcp_tools.items():
-                tools_response += f"- {tool_name}: {tool_info.get('description', '')}\n"
-            yield {
-                "type": "content",
-                "content": [{"type": "text", "text": tools_response}],
-                "done": True,
-            }
+        yield {
+            "type": "content",
+            "content": [{"type": "text", "text": full_response}],
+            "done": True,
+        }
 
     def get_capabilities(self) -> dict:
         all_tools = dict(TOOLS)
@@ -598,19 +448,22 @@ Current working directory is where you were invoked."""
             }
 
         return {
-            "protocol_version": self.protocol_version,
-            "capabilities": {
-                "tools": list(all_tools.keys()),
-                "streaming": True,
-                "sessions": True,
-                "thinking": True,
-                "mcp_servers": list(self.mcp_servers.keys()),
+            "protocolVersion": self.protocol_version,
+            "agentCapabilities": {
+                "loadSession": False,
+                "mcpCapabilities": {"http": False, "sse": False},
+                "promptCapabilities": {
+                    "audio": False,
+                    "embeddedContext": False,
+                    "image": False,
+                },
+                "sessionCapabilities": {},
             },
-            "agent": {
-                "id": "minimax-acp",
+            "agentInfo": {
                 "name": "MiniMax ACP Agent",
-                "description": "An ACP-compatible coding agent powered by MiniMax-M2.7 with thinking and streaming support",
+                "version": "1.0.0",
             },
+            "authMethods": [],
             "tools": all_tools,
         }
 
@@ -649,10 +502,6 @@ async def main():
         except Exception as e:
             print(f"Failed to parse MCP config: {e}", file=sys.stderr)
 
-    capabilities = agent.get_capabilities()
-    response = {"jsonrpc": "2.0", "id": None, "result": capabilities}
-    print(json.dumps(response), flush=True)
-
     current_session_id = str(uuid.uuid4())
 
     for line in sys.stdin:
@@ -677,34 +526,81 @@ async def main():
             response = {"jsonrpc": "2.0", "id": msg_id, "result": result}
             print(json.dumps(response), flush=True)
 
-        elif method == "session/start":
-            session_id = params.get("session_id", str(uuid.uuid4()))
+        elif method == "session/new":
+            session_id = str(uuid.uuid4())
             current_session_id = session_id
             if session_id not in agent.sessions:
                 agent.sessions[session_id] = []
 
             result = {
-                "session_id": session_id,
-                "name": f"MiniMax Session",
+                "sessionId": session_id,
             }
             response = {"jsonrpc": "2.0", "id": msg_id, "result": result}
             print(json.dumps(response), flush=True)
 
-        elif method == "prompt":
-            session_id = params.get("session_id", current_session_id)
-            messages = params.get("messages", [])
+        elif method == "session/prompt":
+            session_id = params.get("sessionId", current_session_id)
+            if session_id not in agent.sessions:
+                agent.sessions[session_id] = []
+                current_session_id = session_id
+            prompt = params.get("prompt", [])
+            messages = []
+            for block in prompt:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    messages.append({"role": "user", "content": block.get("text", "")})
 
             full_response = ""
             async for block in agent.handle_messages_stream(session_id, messages):
-                result = {
-                    "content": block.get("content", []),
-                    "stop_reason": "end_turn" if block.get("done") else "continue",
-                }
-                response = {"jsonrpc": "2.0", "id": msg_id, "result": result}
-                print(json.dumps(response), flush=True)
+                if block.get("type") == "thinking":
+                    notification = {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "thinking",
+                                "thinking": {
+                                    "text": block.get("thinking", ""),
+                                },
+                            },
+                        },
+                    }
+                    print(json.dumps(notification), flush=True)
+                else:
+                    content = block.get("content", [])
+                    text_content = ""
+                    if isinstance(content, list):
+                        for item in content:
+                            if item.get("type") == "text":
+                                text_content += item.get("text", "")
+                    elif isinstance(content, str):
+                        text_content = content
 
-                if block.get("done"):
-                    break
+                    if text_content:
+                        notification = {
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": session_id,
+                                "update": {
+                                    "sessionUpdate": "message",
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": [
+                                            {"type": "text", "text": text_content}
+                                        ],
+                                    },
+                                },
+                            },
+                        }
+                        print(json.dumps(notification), flush=True)
+                        full_response += text_content
+
+            final_result = {
+                "stopReason": "end_turn",
+            }
+            response = {"jsonrpc": "2.0", "id": msg_id, "result": final_result}
+            print(json.dumps(response), flush=True)
 
         elif method == "tool_call":
             tool_name = params.get("name")
