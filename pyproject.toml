@@ -1,0 +1,19 @@
+[project]
+name = "minimax-acp-agent"
+version = "0.1.0"
+description = "ACP agent with MiniMax as backend for JetBrains IDEs"
+requires-python = ">=3.11"
+dependencies = [
+    "agent-client-protocol>=0.1.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+minimax-acp-agent = "src.agent:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
